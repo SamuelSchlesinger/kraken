@@ -547,6 +547,134 @@ def dynamic_stack_example := parse("
     movq -8(%rsp), %rbx
 ")
 
+-- This is definitionally the continuation after directive 0: `drop 1` skips
+-- the completed store, while `layout.size 0` advances the program counter.
+-- Naming it separately lets the two proof phases elaborate independently.
+private def dynamic_stack_after_first [layout : Layout] (s : MachineData) : Effects :=
+  let e := layout dynamic_stack_example
+  let _ : Labels := e.labels
+  Directives.interp (e.2.drop 1) s (e.1 + Int64.ofNat (layout.size 0))
+    (fun pc s => Effects.done (s, pc))
+
+private theorem dynamic_stack_after_first_correct [layout : Layout] (s₁ : MachineData)
+    (stack : List UInt8) (h_stack : stack.length = 1016) R
+    (h_indices : s₁.regs.r9.toNat + s₁.regs.r15.toNat < 125)
+    (h_mem :
+      s₁.dmem =⋆
+        Eq ((Int.toBytes 8 99).At
+          (s₁.regs.rsp.toBitVec + BitVec.ofNat 64 (2 ^ 64 - 8))) ⋆
+        (Eq (stack.At (s₁.regs.rsp.toBitVec - 1024#64)) ⋆ R)) :
+    Effects.All
+      (fun mid =>
+        Eventually (straightlineStep (layout dynamic_stack_example))
+          (fun s' =>
+            s'.1.regs.rax = 42 ∧ s'.1.regs.rbx = 99 ∧
+              s'.1.regs.rsp = s₁.regs.rsp)
+          mid)
+      (dynamic_stack_after_first (layout := layout) s₁) := by
+  cases s₁ with | mk regs zmms flags mem =>
+  cases regs with | mk rax rbx rcx rdx rsi rdi rsp rbp r8 r9 r10 r11 r12 r13 r14 r15 =>
+  change r9.toNat + r15.toNat < 125 at h_indices
+  let offset := 16 + r9.toNat * 8 + r15.toNat * 8
+  let stackBase := rsp.toBitVec - 1024#64
+  let slotAddr := stackBase + BitVec.ofNat 64 offset
+  let slotBytes := (stack.drop offset).take 8
+  let stackRest : DataMem → Prop :=
+    Eq ((stack.take offset).At stackBase) ⋆
+      (Eq (((stack.drop offset).drop 8).At
+        (slotAddr + 8#64)) ⋆ R)
+  let savedSlot : DataMem → Prop :=
+    Eq ((Int.toBytes 8 99).At (rsp.toBitVec + BitVec.ofNat 64 (2 ^ 64 - 8)))
+  let writtenSlot : DataMem → Prop := Eq ((Int.toBytes 8 42).At slotAddr)
+  let targetFrame : DataMem → Prop := savedSlot ⋆ stackRest
+  change (savedSlot ⋆ (Eq (stack.At stackBase) ⋆ R)) mem at h_mem
+  have h_offset : offset + 8 ≤ stack.length := by
+    dsimp only [offset]
+    omega
+  have h_slot_len : slotBytes.length = 8 :=
+    List.length_take_of_le (by
+      simp only [List.length_drop]
+      omega)
+  -- Split the live stack around the dynamically addressed eight-byte slot.
+  have h_stack_split := Mem.At_append_sep (stack.take offset) (stack.drop offset)
+    stackBase (by
+      simp only [List.length_take, List.length_drop]
+      omega)
+  rw [List.take_append_drop] at h_stack_split
+  have h_slot_split := Mem.At_append_sep
+    ((stack.drop offset).take 8) ((stack.drop offset).drop 8) slotAddr (by
+      simp only [List.length_take, List.length_drop]
+      omega)
+  rw [List.take_append_drop] at h_slot_split
+  rw [h_stack_split, List.length_take_of_le (by omega), h_slot_split,
+    h_slot_len] at h_mem
+  have h_slot_before : (Eq (slotBytes.At slotAddr) ⋆ targetFrame) mem := by
+    dsimp only [slotBytes, targetFrame, stackRest]
+    exact cast (congrFun (by ac_rfl) _) h_mem
+  have h_slot_after :=
+    Mem.storeInt_sep slotAddr 8 slotBytes targetFrame mem
+      ⟨h_slot_before, h_slot_len⟩ 42
+  change (writtenSlot ⋆ targetFrame) _ at h_slot_after
+  have h_saved_after := h_slot_after
+  change (writtenSlot ⋆ (savedSlot ⋆ stackRest)) _ at h_saved_after
+  rw [← sep_assoc, sep_comm writtenSlot savedSlot, sep_assoc] at h_saved_after
+  have h_dynamic_addr :
+      rsp.toBitVec + r9.toBitVec * 8#64 + (-1024#64) +
+          r15.toBitVec * 8#64 + 16#64 =
+        slotAddr := by
+    dsimp only [slotAddr, stackBase, offset]
+    simp only [BitVec.ofNat_add, BitVec.ofNat_mul]
+    simp only [show BitVec.ofNat 64 r9.toNat = r9.toBitVec by simp,
+      show BitVec.ofNat 64 r15.toNat = r15.toBitVec by simp]
+    simp only [BitVec.sub_eq_add_neg]
+    ac_rfl
+  have h_ofIntNeg1024 :
+      BitVec.ofInt 64 (-1024 : Int64).toInt = -1024#64 := by decide
+  have h_ofInt16 : BitVec.ofInt 64 (16 : Int64).toInt = 16#64 := by decide
+  have h_ofIntNeg8 :
+      BitVec.ofInt 64 (-8 : Int64).toInt =
+        BitVec.ofNat 64 (2 ^ 64 - 8) := by decide
+  dsimp only [dynamic_stack_after_first, Layout.apply]
+  dsimp only [dynamic_stack_example]
+  simp [List.mapIdx, List.mapIdx.go]
+  sym => kstep; tactic =>
+  rw [store_sep (bs := slotBytes) (R := targetFrame)]
+  case h_mem =>
+    simp only [AddrExpr.interp, ConstExpr.interp, Reg64s.get64, Width.bits,
+        Width.bytes, BitVec.toAddressSize, BitVec.signed, BitVec.take_all,
+        BitVec.ofInt_add, BitVec.ofInt_mul, BitVec.ofInt_toInt,
+        BitVec.zeroExtend_eq_setWidth, BitVec.setWidth_eq, BitVec.ofInt_natCast,
+        h_ofIntNeg1024, h_ofInt16, h_dynamic_addr]
+    exact h_slot_before
+  case h_len => exact h_slot_len
+  sym => kstep; tactic =>
+  rw [load_sep (bs := Int.toBytes 8 42) (R := targetFrame)]
+  case h_mem =>
+    simp only [AddrExpr.interp, ConstExpr.interp, Reg64s.get64, Width.bits,
+        Width.bytes, BitVec.toAddressSize, BitVec.signed, BitVec.take_all,
+        BitVec.ofInt_add, BitVec.ofInt_mul, BitVec.ofInt_toInt,
+        BitVec.zeroExtend_eq_setWidth, BitVec.setWidth_eq, BitVec.ofInt_natCast,
+        h_ofIntNeg1024, h_ofInt16, h_dynamic_addr]
+    exact h_slot_after
+  case h_len => exact Int.toBytes_length 8 42
+  sym => kstep; tactic =>
+  rw [load_sep
+    (bs := Int.toBytes 8 99)
+    (R := writtenSlot ⋆ stackRest)]
+  case h_mem =>
+    simp only [AddrExpr.interp, ConstExpr.interp, Reg64s.get64, Width.bits,
+        Width.bytes, BitVec.toAddressSize, BitVec.signed, BitVec.take_all,
+        BitVec.ofInt_add, BitVec.ofInt_mul, BitVec.ofInt_toInt,
+        BitVec.zeroExtend_eq_setWidth, BitVec.setWidth_eq, Nat.sub_zero,
+        UInt64.toNat_toBitVec, Nat.shiftRight_zero, BitVec.ofNat_uInt64ToNat,
+        h_ofIntNeg1024, h_ofInt16, h_ofIntNeg8, BitVec.ofInt_ofNat,
+        BitVec.ofInt_natCast, BitVec.add_zero, h_dynamic_addr]
+    exact h_saved_after
+  case h_len => exact Int.toBytes_length 8 99
+  apply Eventually.done
+  dsimp [UInt64.toBitVec]
+  exact ⟨by decide, by decide, UInt64.toBitVec_inj.1 (by simp)⟩
+
 theorem dynamic_stack_example_correct [layout : Layout] (s₀ : MachineData)
     (stack : List UInt8) (lstack : stack.length = 1024) R
     (h : s₀.regs.r9.toNat + s₀.regs.r15.toNat < 125)
@@ -559,6 +687,7 @@ theorem dynamic_stack_example_correct [layout : Layout] (s₀ : MachineData)
   change (straightlineStep _ (ss, _) _)
   cases s₀ with | mk regs zmms flags mem =>
   cases regs with | mk rax rbx rcx rdx rsi rdi rsp rbp r8 r9 r10 r11 r12 r13 r14 r15 =>
+  change r9.toNat + r15.toNat < 125 at h
   have h_bs : stack.length = 1024 := lstack
   have h_take_drop : stack = stack.take 1016 ++ stack.drop 1016 := by exact (List.take_append_drop 1016 stack).symm
   rw [h_take_drop] at h_mem
@@ -588,9 +717,12 @@ theorem dynamic_stack_example_correct [layout : Layout] (s₀ : MachineData)
   rw [h_addr_eq] at h_mem
   replace h_mem : (Eq ((stack.drop 1016).At (rsp.toBitVec + BitVec.ofNat 64 (2^64 - 8))) ⋆ (Eq ((stack.take 1016).At (rsp.toBitVec - 1024#64)) ⋆ R)) _ := cast (congrFun (by ac_rfl) _) h_mem
   have h_mem1 := Mem.storeInt_sep (rsp.toBitVec + BitVec.ofNat 64 (2^64 - 8)) 8 (stack.drop 1016) (Eq ((stack.take 1016).At (rsp.toBitVec - 1024#64)) ⋆ R) mem ⟨h_mem, h_len_drop⟩ 99
+  let s₁ : MachineData :=
+    { ss with
+      dmem := Mem.storeInt mem
+        (rsp.toBitVec + BitVec.ofNat 64 (2 ^ 64 - 8)) 8 99 }
   rw [store_sep ss]
   case h_mem => exact h_mem
   case h_len => exact h_len_drop
-  sym =>
-  -- FIXME: kstep here takes too long
-  sorry
+  change Effects.All _ (dynamic_stack_after_first (layout := layout) s₁)
+  exact dynamic_stack_after_first_correct s₁ (stack.take 1016) h_len_take R h h_mem1
